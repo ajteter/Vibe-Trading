@@ -245,18 +245,22 @@ _SP500_FALLBACK_CODES = [
 
 
 def _load_csi300_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
-    """CSI 300 panel via Tushare. Includes ``amount`` (required by gtja191).
-
-    Constituents are taken from the most recent ``index_weight`` snapshot in
-    the requested window; if that call fails we degrade to a 30-name
-    blue-chip fallback so the bench still runs.
-    """
+    """CSI 300 panel with Tushare primary and BaoStock fallback."""
     token = os.getenv("TUSHARE_TOKEN", "").strip()
-    if not token or token == "your-tushare-token":
-        raise RuntimeError(
-            "TUSHARE_TOKEN not in agent/.env or environment; required for csi300 universe"
-        )
+    if token and token != "your-tushare-token":
+        return _load_csi300_panel_tushare(start, end, token)
+    if _baostock_available():
+        logger.warning("csi300: TUSHARE_TOKEN missing; using BaoStock fallback")
+        return _load_csi300_panel_baostock(start, end)
+    raise RuntimeError(
+        "CSI300 universe requires either TUSHARE_TOKEN or installed baostock fallback"
+    )
 
+
+def _load_csi300_panel_tushare(
+    start: str, end: str, token: str
+) -> dict[str, pd.DataFrame]:
+    """CSI 300 panel via Tushare. Includes ``amount`` (required by gtja191)."""
     try:
         import tushare as ts
     except ImportError as exc:
@@ -286,9 +290,6 @@ def _load_csi300_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
         codes = list(_CSI300_FALLBACK_CODES)
         logger.warning("csi300: using %d-name fallback (degraded run)", len(codes))
 
-    # Fetch raw daily in parallel — we need ``amount`` which the standard
-    # loader drops. Tushare's free tier permits ~200 calls/min so 4 concurrent
-    # workers is comfortably under the rate limit even for a full 300-name list.
     def _fetch_one(code: str) -> tuple[str, pd.DataFrame | None]:
         df = _retry(lambda: pro.daily(ts_code=code, start_date=sd, end_date=ed))
         if df is None or df.empty:
@@ -309,16 +310,13 @@ def _load_csi300_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
         for fut in as_completed(futures):
             try:
                 code, frame = fut.result()
-            except Exception as exc:  # noqa: BLE001 — _retry already logged
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("csi300 fetch worker raised: %s", exc)
                 continue
             if frame is not None and not frame.empty:
                 fetched[code] = frame
 
     panel = _wide_from_fetched(fetched, include_amount=True)
-    # CN equity vwap: Tushare ``amount`` is in 千元, ``volume`` in 手. True VWAP
-    # = (amount * 1000 CNY) / (volume * 100 shares). Matches
-    # ``src.factors.base.vwap(EQUITY_CN)``.
     if "amount" in panel and "volume" in panel:
         from src.factors.base import safe_div
 
@@ -326,6 +324,124 @@ def _load_csi300_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
             panel["amount"] * 1000.0, panel["volume"] * 100.0 + 1.0
         )
     return panel
+
+
+def _baostock_available() -> bool:
+    try:
+        import baostock  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _baostock_to_tushare_code(code: str) -> str:
+    market, symbol = code.lower().split(".", 1)
+    if market == "sh":
+        return f"{symbol}.SH"
+    if market == "sz":
+        return f"{symbol}.SZ"
+    raise ValueError(f"unsupported BaoStock market prefix: {code}")
+
+
+def _tushare_to_baostock_code(code: str) -> str:
+    symbol, suffix = code.upper().split(".", 1)
+    if suffix == "SH":
+        return f"sh.{symbol}"
+    if suffix == "SZ":
+        return f"sz.{symbol}"
+    raise ValueError(f"unsupported A-share suffix: {code}")
+
+
+def _load_csi300_panel_baostock(start: str, end: str) -> dict[str, pd.DataFrame]:
+    """CSI 300 panel via BaoStock anonymous free API."""
+    import baostock as bs
+
+    login_rs = bs.login()
+    if getattr(login_rs, "error_code", "") != "0":
+        raise RuntimeError(f"baostock login failed: {getattr(login_rs, 'error_msg', '')}")
+
+    try:
+        codes = _fetch_csi300_codes_baostock(bs, end)
+        fetched = _fetch_csi300_daily_baostock(bs, codes, start, end)
+        panel = _wide_from_fetched(fetched, include_amount=True)
+        if all(k in panel for k in ("open", "high", "low", "close")):
+            panel["vwap"] = (
+                panel["open"] + panel["high"] + panel["low"] + panel["close"]
+            ) / 4.0
+        return panel
+    finally:
+        try:
+            bs.logout()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("baostock logout failed: %s", exc)
+
+
+def _fetch_csi300_codes_baostock(bs: Any, end: str) -> list[str]:
+    rs = bs.query_hs300_stocks(date=end)
+    if getattr(rs, "error_code", "") != "0":
+        raise RuntimeError(
+            f"baostock query_hs300_stocks failed: {getattr(rs, 'error_msg', '')}"
+        )
+    fields = list(getattr(rs, "fields", []))
+    codes: list[str] = []
+    while rs.next():
+        row = dict(zip(fields, rs.get_row_data()))
+        code = row.get("code")
+        if code:
+            try:
+                codes.append(_baostock_to_tushare_code(code))
+            except ValueError as exc:
+                logger.warning("skip unsupported baostock code %s: %s", code, exc)
+    if not codes:
+        logger.warning(
+            "baostock hs300 returned no codes; using %d fallback codes",
+            len(_CSI300_FALLBACK_CODES),
+        )
+        return list(_CSI300_FALLBACK_CODES)
+    logger.info("csi300: %d constituents from BaoStock @ %s", len(codes), end)
+    return codes
+
+
+def _fetch_csi300_daily_baostock(
+    bs: Any, codes: list[str], start: str, end: str
+) -> dict[str, pd.DataFrame]:
+    fetched: dict[str, pd.DataFrame] = {}
+    for code in codes:
+        bs_code = _tushare_to_baostock_code(code)
+        rs = bs.query_history_k_data_plus(
+            bs_code,
+            "date,code,open,high,low,close,volume,amount",
+            start_date=start,
+            end_date=end,
+            frequency="d",
+            adjustflag="2",
+        )
+        if getattr(rs, "error_code", "") != "0":
+            logger.warning(
+                "baostock fetch failed for %s: %s",
+                code,
+                getattr(rs, "error_msg", ""),
+            )
+            continue
+        fields = list(getattr(rs, "fields", []))
+        rows = []
+        while rs.next():
+            rows.append(dict(zip(fields, rs.get_row_data())))
+        if not rows:
+            continue
+        df = pd.DataFrame(rows)
+        if "date" not in df.columns:
+            continue
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        for col in ("open", "high", "low", "close", "volume", "amount"):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        keep = [c for c in ("open", "high", "low", "close", "volume", "amount") if c in df.columns]
+        frame = df[keep].dropna(subset=["open", "high", "low", "close"])
+        if not frame.empty:
+            fetched[code] = frame
+    return fetched
 
 
 def _load_sp500_panel(start: str, end: str) -> dict[str, pd.DataFrame]:
